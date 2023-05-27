@@ -32,7 +32,7 @@ import base64
 from pathlib import Path
 from PIL import Image, ImageFilter, ImageOps
 from scripts.lvminthin import lvmin_thin, nake_nms
-from scripts.processor import preprocessor_sliders_config, flag_preprocessor_resolution, model_free_preprocessors
+from scripts.processor import preprocessor_sliders_config, flag_preprocessor_resolution, model_free_preprocessors, preprocessor_filters
 
 gradio_compat = True
 try:
@@ -352,6 +352,12 @@ class Script(scripts.Script):
             selected = dd if dd in global_state.cn_models else "None"
             return gr.Dropdown.update(value=selected, choices=list(global_state.cn_models.keys()))
 
+        if shared.opts.data.get("controlnet_disable_control_type", False):
+            type_filter = None
+        else:
+            with gr.Row():
+                type_filter = gr.Radio(list(preprocessor_filters.keys()), label=f"Control Type", value='All', elem_id=f'{elem_id_tabname}_{tabname}_controlnet_type_filter_radio')
+
         with gr.Row():
             module = gr.Dropdown(global_state.ui_preprocessor_keys, label=f"Preprocessor", value=default_unit.module, elem_id=f'{elem_id_tabname}_{tabname}_controlnet_preprocessor_dropdown')
             trigger_preprocessor = ToolButton(value=trigger_symbol, visible=True, elem_id=f'{elem_id_tabname}_{tabname}_controlnet_trigger_preprocessor')
@@ -408,6 +414,35 @@ class Script(scripts.Script):
         if gradio_compat:
             module.change(build_sliders, inputs=[module, pixel_perfect], outputs=[processor_res, threshold_a, threshold_b, advanced, model, refresh_models])
             pixel_perfect.change(build_sliders, inputs=[module, pixel_perfect], outputs=[processor_res, threshold_a, threshold_b, advanced, model, refresh_models])
+
+            if type_filter is not None:
+                def filter_selected(k, pp):
+                    default_option = preprocessor_filters[k]
+                    pattern = k.lower()
+                    preprocessor_list = global_state.ui_preprocessor_keys
+                    model_list = list(global_state.cn_models.keys())
+                    if pattern == 'all':
+                        return [gr.Dropdown.update(value='none', choices=preprocessor_list),
+                                gr.Dropdown.update(value='None', choices=model_list)] + build_sliders('none', pp)
+                    filtered_preprocessor_list = [x for x in preprocessor_list if pattern in x.lower() or x.lower() == 'none']
+                    if pattern in ['canny', 'lineart', 'scribble', 'mlsd']:
+                        filtered_preprocessor_list += [x for x in preprocessor_list if 'invert' in x.lower()]
+                    filtered_model_list = [x for x in model_list if pattern in x.lower() or x.lower() == 'none']
+                    if default_option not in filtered_preprocessor_list:
+                        default_option = filtered_preprocessor_list[0]
+                    if len(filtered_model_list) == 1:
+                        default_model = 'None'
+                        filtered_model_list = model_list
+                    else:
+                        default_model = filtered_model_list[1]
+                        for x in filtered_model_list:
+                            if '11' in x.split('[')[0]:
+                                default_model = x
+                                break
+                    return [gr.Dropdown.update(value=default_option, choices=filtered_preprocessor_list),
+                            gr.Dropdown.update(value=default_model, choices=filtered_model_list)] + build_sliders(default_option, pp)
+
+                type_filter.change(filter_selected, inputs=[type_filter, pixel_perfect], outputs=[module, model, processor_res, threshold_a, threshold_b, advanced, model, refresh_models])
 
         # infotext_fields.extend((module, model, weight))
 
@@ -530,7 +565,7 @@ class Script(scripts.Script):
         else:
             send_dimen_button.click(fn=send_dimensions, inputs=[input_image], outputs=[self.txt2img_w_slider, self.txt2img_h_slider])
 
-        control_mode = gr.Radio(choices=[e.value for e in external_code.ControlMode], value=default_unit.control_mode.value, label="Control Mode", elem_id=f'{elem_id_tabname}_{tabname}_controlnet_control_mod_radio')
+        control_mode = gr.Radio(choices=[e.value for e in external_code.ControlMode], value=default_unit.control_mode.value, label="Control Mode", elem_id=f'{elem_id_tabname}_{tabname}_controlnet_control_mode_radio')
 
         resize_mode = gr.Radio(choices=[e.value for e in external_code.ResizeMode], value=default_unit.resize_mode.value, label="Resize Mode", elem_id=f'{elem_id_tabname}_{tabname}_controlnet_resize_mode_radio')
 
@@ -848,7 +883,7 @@ class Script(scripts.Script):
             # below is very boring but do not change these. If you change these Apple or Mac may fail.
             y = torch.from_numpy(y)
             y = y.float() / 255.0
-            y = rearrange(y, 'h w c -> c h w')
+            y = rearrange(y, 'h w c -> 1 c h w')
             y = y.clone()
             y = y.to(devices.get_device_for("controlnet"))
             y = y.clone()
@@ -900,7 +935,9 @@ class Script(scripts.Script):
                 y = np.stack([y] * 3, axis=2)
 
             if inpaint_mask is not None:
-                y[inpaint_mask > 127] = - 255
+                inpaint_mask = (inpaint_mask > 127).astype(np.float32) * 255.0
+                inpaint_mask = inpaint_mask[:, :, None].clip(0, 255).astype(np.uint8)
+                y = np.concatenate([y, inpaint_mask], axis=2)
 
             return y
 
@@ -1228,17 +1265,17 @@ class Script(scripts.Script):
             if model_net is not None:
                 if model_net.config.model.params.get("global_average_pooling", False):
                     global_average_pooling = True
-            elif unit.module in model_free_preprocessors:
-                # Pass preprocessor parameters to model-free control
-                model_net = dict(
-                    name=unit.module,
-                    preprocessor_resolution=preprocessor_resolution,
-                    threshold_a=unit.threshold_a,
-                    threshold_b=unit.threshold_b
-                )
+
+            preprocessor_dict = dict(
+                name=unit.module,
+                preprocessor_resolution=preprocessor_resolution,
+                threshold_a=unit.threshold_a,
+                threshold_b=unit.threshold_b
+            )
 
             forward_param = ControlParams(
                 control_model=model_net,
+                preprocessor=preprocessor_dict,
                 hint_cond=control,
                 weight=unit.weight,
                 guidance_stopped=False,
@@ -1285,9 +1322,14 @@ class Script(scripts.Script):
                         for detect_map, module in self.detected_map:
                             if detect_map is None:
                                 continue
+                            detect_map = np.ascontiguousarray(detect_map.copy()).copy()
+                            if detect_map.ndim == 3 and detect_map.shape[2] == 4:
+                                inpaint_mask = detect_map[:, :, 3]
+                                detect_map = detect_map[:, :, 0:3]
+                                detect_map[inpaint_mask > 127] = 0
                             processed.images.extend([
                                 Image.fromarray(
-                                    np.ascontiguousarray(detect_map.copy()).copy().clip(0, 255).astype(np.uint8)
+                                    detect_map.clip(0, 255).astype(np.uint8)
                                 )
                             ])
 
@@ -1357,6 +1399,8 @@ def on_ui_settings():
         False, "Show batch images in gradio gallery output", gr.Checkbox, {"interactive": True}, section=section))
     shared.opts.add_option("controlnet_increment_seed_during_batch", shared.OptionInfo(
         False, "Increment seed after each controlnet batch iteration", gr.Checkbox, {"interactive": True}, section=section))
+    shared.opts.add_option("controlnet_disable_control_type", shared.OptionInfo(
+        False, "Disable control type selection", gr.Checkbox, {"interactive": True}, section=section))
 
 
 def on_after_component(component, **_kwargs):

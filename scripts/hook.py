@@ -1,5 +1,7 @@
 import torch
 import einops
+import hashlib
+import numpy as np
 import torch.nn as nn
 
 from enum import Enum
@@ -10,6 +12,7 @@ cond_cast_unet = getattr(devices, 'cond_cast_unet', lambda x: x)
 from ldm.modules.diffusionmodules.util import timestep_embedding
 from ldm.modules.diffusionmodules.openaimodel import UNetModel
 from ldm.modules.attention import BasicTransformerBlock
+from ldm.models.diffusion.ddpm import extract_into_tensor
 
 from modules.prompt_parser import MulticondLearnedConditioning, ComposableScheduledPromptConditioning, ScheduledPromptConditioning
 
@@ -140,6 +143,7 @@ class ControlParams:
     def __init__(
             self,
             control_model,
+            preprocessor,
             hint_cond,
             weight,
             guidance_stopped,
@@ -154,6 +158,7 @@ class ControlParams:
             **kwargs  # To avoid errors
     ):
         self.control_model = control_model
+        self.preprocessor = preprocessor
         self._hint_cond = hint_cond
         self.weight = weight
         self.guidance_stopped = guidance_stopped
@@ -209,6 +214,39 @@ def torch_dfs(model: torch.nn.Module):
     for child in model.children():
         result += torch_dfs(child)
     return result
+
+
+def predict_start_from_noise(ldm, x_t, t, noise):
+    return extract_into_tensor(ldm.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t - extract_into_tensor(ldm.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
+
+
+def predict_noise_from_start(ldm, x_t, t, x0):
+    return (extract_into_tensor(ldm.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t - x0) / extract_into_tensor(ldm.sqrt_recipm1_alphas_cumprod, t, x_t.shape)
+
+
+def blur(x, k):
+    y = torch.nn.functional.pad(x, (k, k, k, k), mode='replicate')
+    y = torch.nn.functional.avg_pool2d(y, (k*2+1, k*2+1), stride=(1, 1))
+    return y
+
+
+class TorchCache:
+    def __init__(self):
+        self.cache = {}
+
+    def hash(self, key):
+        v = key.detach().cpu().numpy().astype(np.float32)
+        v = (v * 1000.0).astype(np.int32)
+        v = np.ascontiguousarray(v.copy())
+        sha = hashlib.sha1(v).hexdigest()
+        return sha
+
+    def get(self, key):
+        key = self.hash(key)
+        return self.cache.get(key, None)
+
+    def set(self, key, value):
+        self.cache[self.hash(key)] = value
 
 
 class UnetHook(nn.Module):
@@ -269,9 +307,9 @@ class UnetHook(nn.Module):
                     param.used_hint_cond_latent = None
 
                 # has high-res fix
-                if param.hr_hint_cond is not None and x.ndim == 4 and param.hint_cond.ndim == 3 and param.hr_hint_cond.ndim == 3:
-                    _, h_lr, w_lr = param.hint_cond.shape
-                    _, h_hr, w_hr = param.hr_hint_cond.shape
+                if param.hr_hint_cond is not None and x.ndim == 4 and param.hint_cond.ndim == 4 and param.hr_hint_cond.ndim == 4:
+                    _, _, h_lr, w_lr = param.hint_cond.shape
+                    _, _, h_hr, w_hr = param.hr_hint_cond.shape
                     _, _, h, w = x.shape
                     h, w = h * 8, w * 8
                     if abs(h - h_lr) < abs(h - h_hr):
@@ -289,19 +327,29 @@ class UnetHook(nn.Module):
             for param in outer.control_params:
                 if param.used_hint_cond_latent is not None:
                     continue
-                if param.control_model_type not in [ControlModelType.AttentionInjection]:
+                if param.control_model_type not in [ControlModelType.AttentionInjection] \
+                        and 'colorfix' not in param.preprocessor['name'] \
+                        and 'inpaint_only' not in param.preprocessor['name']:
                     continue
                 try:
+                    pixel_hint = param.used_hint_cond
+                    if pixel_hint.shape[1] > 3:
+                        pixel_hint = pixel_hint[:, 0:3, :, :]
+                    pixel_hint = pixel_hint * 2.0 - 1.0
+                    pixel_hint = pixel_hint.type(devices.dtype_vae)
+                    vae_output = outer.vae_cache.get(pixel_hint)
+                    if vae_output is None:
+                        with devices.autocast():
+                            vae_output = outer.sd_ldm.encode_first_stage(pixel_hint)
+                            vae_output = outer.sd_ldm.get_first_stage_encoding(vae_output)
+                        outer.vae_cache.set(pixel_hint, vae_output)
+                        print(f'ControlNet used {str(devices.dtype_vae)} VAE to encode {vae_output.shape}.')
+                    latent_hint = vae_output
                     query_size = int(x.shape[0])
-                    latent_hint = param.used_hint_cond[None] * 2.0 - 1.0
-                    latent_hint = latent_hint.type(devices.dtype_vae)
-                    with devices.autocast():
-                        latent_hint = outer.sd_ldm.encode_first_stage(latent_hint)
-                        latent_hint = outer.sd_ldm.get_first_stage_encoding(latent_hint)
-                    latent_hint = torch.cat([latent_hint.clone() for _ in range(query_size)], dim=0)
+                    if latent_hint.shape[0] != query_size:
+                        latent_hint = torch.cat([latent_hint.clone() for _ in range(query_size)], dim=0)
                     latent_hint = latent_hint.type(devices.dtype_unet)
                     param.used_hint_cond_latent = latent_hint
-                    print(f'ControlNet used {str(devices.dtype_vae)} VAE to encode {latent_hint.shape}.')
                 except Exception as e:
                     print(e)
                     param.used_hint_cond_latent = None
@@ -343,7 +391,17 @@ class UnetHook(nn.Module):
                         require_inpaint_hijack = True
 
                 assert param.used_hint_cond is not None, f"Controlnet is enabled but no input image is given"
-                control = param.control_model(x=x_in, hint=param.used_hint_cond, timesteps=timesteps, context=context)
+
+                hint = param.used_hint_cond
+
+                # ControlNet inpaint protocol
+                if hint.shape[1] == 4:
+                    c = hint[:, 0:3, :, :]
+                    m = hint[:, 3:4, :, :]
+                    m = (m > 0.5).float()
+                    hint = c * (1 - m) - m
+
+                control = param.control_model(x=x_in, hint=hint, timesteps=timesteps, context=context)
                 control_scales = ([param.weight] * 13)
 
                 if outer.lowvram:
@@ -416,7 +474,7 @@ class UnetHook(nn.Module):
                         param.used_hint_cond_latent
                     ], dim=1)
 
-                outer.current_style_fidelity = float(param.control_model.get('threshold_a', 0.5))
+                outer.current_style_fidelity = float(param.preprocessor['threshold_a'])
                 outer.current_style_fidelity = max(0.0, min(1.0, outer.current_style_fidelity))
 
                 if param.cfg_injection:
@@ -424,7 +482,7 @@ class UnetHook(nn.Module):
                 elif param.soft_injection or is_in_high_res_fix:
                     outer.current_style_fidelity = 0.0
 
-                control_name = param.control_model.get('name', None)
+                control_name = param.preprocessor['name']
 
                 if control_name in ['reference_only', 'reference_adain+attn']:
                     outer.attention_auto_machine = AutoMachine.Write
@@ -469,6 +527,53 @@ class UnetHook(nn.Module):
             # U-Net Output
             h = h.type(x.dtype)
             h = self.out(h)
+
+            # Post-processing for color fix
+            for param in outer.control_params:
+                if param.used_hint_cond_latent is None:
+                    continue
+                if 'colorfix' not in param.preprocessor['name']:
+                    continue
+
+                k = int(param.preprocessor['threshold_a'])
+                if is_in_high_res_fix:
+                    k *= 2
+
+                x0_origin = param.used_hint_cond_latent
+                t = torch.round(timesteps.float()).long()
+                x0_prd = predict_start_from_noise(outer.sd_ldm, x, t, h)
+                x0 = x0_prd - blur(x0_prd, k) + blur(x0_origin, k)
+
+                if '+sharp' in param.preprocessor['name']:
+                    detail_weight = float(param.preprocessor['threshold_b']) * 0.01
+                    neg = detail_weight * blur(x0, k) + (1 - detail_weight) * x0
+                    x0 = cond_mark * x0 + (1 - cond_mark) * neg
+
+                eps_prd = predict_noise_from_start(outer.sd_ldm, x, t, x0)
+
+                w = max(0.0, min(1.0, float(param.weight)))
+                h = eps_prd * w + h * (1 - w)
+
+            # Post-processing for restore
+            for param in outer.control_params:
+                if param.used_hint_cond_latent is None:
+                    continue
+                if 'inpaint_only' not in param.preprocessor['name']:
+                    continue
+                if param.used_hint_cond.shape[1] != 4:
+                    continue
+
+                mask = param.used_hint_cond[:, 3:4, :, :]
+                mask = torch.nn.functional.avg_pool2d(mask, (8, 8))
+
+                x0_origin = param.used_hint_cond_latent
+                t = torch.round(timesteps.float()).long()
+                x0_prd = predict_start_from_noise(outer.sd_ldm, x, t, h)
+                x0 = x0_prd * mask + x0_origin * (1 - mask)
+                eps_prd = predict_noise_from_start(outer.sd_ldm, x, t, x0)
+
+                w = max(0.0, min(1.0, float(param.weight)))
+                h = eps_prd * w + h * (1 - w)
 
             return h
 
@@ -555,6 +660,8 @@ class UnetHook(nn.Module):
         model._original_forward = model.forward
         outer.original_forward = model.forward
         model.forward = forward_webui.__get__(model, UNetModel)
+
+        outer.vae_cache = TorchCache()
 
         all_modules = torch_dfs(model)
 
