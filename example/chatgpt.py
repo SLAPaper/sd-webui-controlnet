@@ -659,7 +659,7 @@ if __name__ == '__main__':
         state = gr.State([])
         with gr.Row():
             with gr.Column(scale=0.7):
-                txt = gr.Textbox(show_label=False, placeholder="Enter text and press enter, or upload an image").style(container=False)
+                txt = gr.Textbox(show_label=False, placeholder="Enter text and press enter, or upload an image", container=False)
             with gr.Column(scale=0.15, min_width=0):
                 clear = gr.Button("Clear️")
             with gr.Column(scale=0.15, min_width=0):
